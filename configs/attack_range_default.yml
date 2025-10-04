@@ -140,7 +140,7 @@ splunk_server:
     - cisco-endpoint-security-analytics-(cesa)-add-on-for-splunk_407.tgz
     - cisco-secure-endpoint-(formerly-amp-for-endpoints)-cim-add-on_212.tgz
     - cisco-secure-endpoint-(formerly-amp-for-endpoints)_300.tgz
-    - cisco-security-cloud_340.tgz
+    - cisco-security-cloud_341.tgz
     - cisco-splunk-add-on-for-appdynamics_314.tgz
     - microsoft-defender-advanced-hunting-add-on-for-splunk_141.tgz
     - palo-alto-networks-add-on-for-splunk_813.tgz
@@ -166,7 +166,7 @@ splunk_server:
     - splunk-ai-toolkit_563.tgz
     - splunk-app-for-stream_815.tgz
     - splunk-common-information-model-(cim)_620.tgz
-    - splunk-es-content-update_5130.tgz
+    - splunk-es-content-update_5140.tgz
     - splunk-sankey-diagram---custom-visualization_160.tgz
     - splunk-security-essentials_382.tgz
     - splunk-ta-for-suricata_233.tgz
