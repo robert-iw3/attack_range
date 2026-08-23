@@ -7,9 +7,11 @@ import os
 import sys
 import argparse
 import glob
+import json
 import yaml
 
 from attack_range.attack_range_controller import AttackRangeController
+from attack_range.managers.ansible_manager import resolve_local_role_name
 from attack_range.utils import prepare_config_from_template, resolve_template_path
 
 os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
@@ -187,10 +189,41 @@ def simulate_action(args):
             print(f"Error: Config file not found: {config_path}")
             sys.exit(1)
     
-    # Parse techniques (comma-separated)
-    techniques = [t.strip() for t in args.techniques.split(",") if t.strip()]
-    if not techniques:
-        print("Error: No techniques specified. Please provide at least one technique ID.")
+    techniques = []
+    if args.techniques:
+        techniques = [t.strip() for t in args.techniques.split(",") if t.strip()]
+
+    atomics = []
+    if args.atomics:
+        for part in args.atomics.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                print(
+                    f"Error: Invalid atomic entry {part!r}. "
+                    "Use TECHNIQUE:GUID (e.g., T1003.001:0be2230c-9ab3-4ac2-8826-3199b9a0ebf8)."
+                )
+                sys.exit(1)
+            technique, guid = part.split(":", 1)
+            atomics.append({"technique": technique.strip(), "guid": guid.strip()})
+
+    atomic_files = []
+    if args.atomic_files:
+        for file_path in args.atomic_files.split(","):
+            file_path = file_path.strip()
+            if not file_path:
+                continue
+            if not os.path.isfile(file_path):
+                print(f"Error: Atomic file not found: {file_path}")
+                sys.exit(1)
+            atomic_files.append({"path": os.path.abspath(file_path)})
+
+    if not techniques and not atomics and not atomic_files:
+        print(
+            "Error: Specify at least one technique ID (--techniques), "
+            "atomic (--atomics TECHNIQUE:GUID,...), or atomic file (--atomic-file PATH,...)."
+        )
         sys.exit(1)
     
     # Load config from the specified file
@@ -198,7 +231,96 @@ def simulate_action(args):
     # Get absolute path to config file
     config_path = os.path.abspath(config_path)
     controller = AttackRangeController(config, config_path=config_path)
-    controller.simulate(args.target, techniques)
+    controller.simulate(args.target, techniques, atomics, atomic_files)
+
+
+def _resolve_config_path(config_arg: str | None) -> str:
+    """Resolve config path from CLI arg or single config in config/."""
+    config_dir = os.path.join(os.path.dirname(__file__), "config")
+
+    if not config_arg:
+        yml_files = glob.glob(os.path.join(config_dir, "*.yml"))
+        if not yml_files:
+            print("Error: No config files found in config folder.")
+            print("Please specify a config file using --config")
+            sys.exit(1)
+        if len(yml_files) > 1:
+            print(f"Error: Multiple config files found ({len(yml_files)} files).")
+            print("Please specify which config file to use with --config")
+            print("\nAvailable config files:")
+            for yml_file in sorted(yml_files):
+                print(f"  - {os.path.basename(yml_file)}")
+            sys.exit(1)
+        return os.path.abspath(yml_files[0])
+
+    config_path = config_arg
+    if os.path.dirname(config_path) in ("", "."):
+        config_path = os.path.join(config_dir, os.path.basename(config_path))
+    if not os.path.exists(config_path):
+        print(f"Error: Config file not found: {config_path}")
+        sys.exit(1)
+    return os.path.abspath(config_path)
+
+
+def _load_role_vars_file(vars_file_path: str, role_paths: list[str]) -> dict[str, dict]:
+    """Load per-role vars from YAML/JSON; shared vars apply to all roles when unkeyed."""
+    with open(vars_file_path, "r", encoding="utf-8") as f:
+        if vars_file_path.endswith(".json"):
+            data = json.load(f)
+        else:
+            data = yaml.safe_load(f)
+
+    if not data:
+        return {}
+    if not isinstance(data, dict):
+        print("Error: --vars-file must contain a YAML/JSON object.")
+        sys.exit(1)
+
+    resolved_names = [resolve_local_role_name(os.path.abspath(path)) for path in role_paths]
+    if any(name in data for name in resolved_names):
+        return {name: data.get(name, {}) or {} for name in resolved_names}
+    return {name: data for name in resolved_names}
+
+
+def apply_role_action(args):
+    """Execute apply-role action."""
+    if not args.role:
+        print("Error: Specify at least one local role directory with -r/--role.")
+        sys.exit(1)
+
+    for role_path in args.role:
+        if not os.path.isdir(role_path):
+            print(f"Error: Role directory not found: {role_path}")
+            sys.exit(1)
+
+    config_path = _resolve_config_path(args.config)
+    vars_by_role = {}
+    if args.vars_file:
+        if not os.path.isfile(args.vars_file):
+            print(f"Error: Vars file not found: {args.vars_file}")
+            sys.exit(1)
+        vars_by_role = _load_role_vars_file(args.vars_file, args.role)
+
+    roles = []
+    for role_path in args.role:
+        abs_path = os.path.abspath(role_path)
+        role_name = resolve_local_role_name(abs_path)
+        role_entry = {"path": abs_path}
+        if vars_by_role:
+            role_entry["vars"] = vars_by_role.get(role_name, {})
+        roles.append(role_entry)
+
+    config = load_config(config_path)
+    controller = AttackRangeController(config, config_path=config_path)
+    try:
+        result = controller.apply_role(args.target, roles)
+        print(f"Successfully applied role(s) on {result['target']}: {', '.join(result['roles_applied'])}")
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
 
 def share_action(args):
@@ -302,10 +424,55 @@ def main():
     simulate_parser.add_argument(
         "-te",
         "--techniques",
-        required=True,
-        help="Comma-separated list of MITRE ATT&CK technique IDs (e.g., T1003.001,T1059.003)",
+        help="Comma-separated MITRE ATT&CK technique IDs (e.g., T1003.001,T1059.003); runs all atomics per technique",
+    )
+    simulate_parser.add_argument(
+        "-a",
+        "--atomics",
+        help=(
+            "Comma-separated TECHNIQUE:GUID pairs (e.g., "
+            "T1003.001:0be2230c-9ab3-4ac2-8826-3199b9a0ebf8); runs one atomic per pair"
+        ),
+    )
+    simulate_parser.add_argument(
+        "-f",
+        "--atomic-file",
+        dest="atomic_files",
+        help=(
+            "Comma-separated paths to custom atomic YAML files on this machine "
+            "(deployed to the target host and executed)"
+        ),
     )
     simulate_parser.set_defaults(func=simulate_action)
+
+    # Apply-role action
+    apply_role_parser = subparsers.add_parser(
+        "apply-role",
+        help="Stage and execute local Ansible roles against a target server",
+    )
+    apply_role_parser.add_argument(
+        "-c",
+        "--config",
+        help="Path to the config file (optional if only one config exists in config/ folder)",
+    )
+    apply_role_parser.add_argument(
+        "-t",
+        "--target",
+        required=True,
+        help="Target server name (must match a server name in attack_range config)",
+    )
+    apply_role_parser.add_argument(
+        "-r",
+        "--role",
+        action="append",
+        required=True,
+        help="Path to a local Ansible role directory (repeat for multiple roles)",
+    )
+    apply_role_parser.add_argument(
+        "--vars-file",
+        help="YAML or JSON file with role variables (keyed by role name, or shared across all roles)",
+    )
+    apply_role_parser.set_defaults(func=apply_role_action)
 
     # Share action
     share_parser = subparsers.add_parser(

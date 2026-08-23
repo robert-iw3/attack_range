@@ -14,7 +14,7 @@ from .logger import setup_logging
 # Import managers
 from .managers.config_manager import ConfigManager
 from .managers.terraform_manager import TerraformManager
-from .managers.ansible_manager import AnsibleManager
+from .managers.ansible_manager import AnsibleManager, APPLY_LOCAL_ROLES_PLAYBOOK
 from .managers.ssh_manager import SSHManager
 from .managers.backend_manager import BackendManager
 
@@ -212,6 +212,10 @@ class AttackRangeController:
             self.logger.info("="*80 + "\n")
             return router_public_ip, wireguard_config
         else:
+            # Install lab Galaxy roles before VPN while public DNS/internet still works
+            self.ansible_manager.update_lab_playbook()
+            self.ansible_manager.ensure_playbook_roles_installed("lab.yaml")
+
             # For CLI: prompt user to connect to VPN, then continue with lab phase
             self.ansible_manager.prompt_vpn_connection()
             self.build_lab_phase(attack_range_id, router_public_ip)
@@ -224,12 +228,32 @@ class AttackRangeController:
             self.logger.info(f"Configuration saved to: {config_file_path}")
             self.logger.info("="*80 + "\n")
 
-    def build_vpn_phase(self, attack_range_id: str, abort_check: Optional[Callable[[], bool]] = None) -> tuple:
+    def _run_terraform_step(
+        self,
+        terraform_running_callback: Optional[Callable[[bool], None]],
+        step: Callable[[], None],
+    ) -> None:
+        """Run a Terraform step and report running state via callback."""
+        if terraform_running_callback:
+            terraform_running_callback(True)
+        try:
+            step()
+        finally:
+            if terraform_running_callback:
+                terraform_running_callback(False)
+
+    def build_vpn_phase(
+        self,
+        attack_range_id: str,
+        abort_check: Optional[Callable[[], bool]] = None,
+        terraform_running_callback: Optional[Callable[[bool], None]] = None,
+    ) -> tuple:
         """
         Build VPN infrastructure (Phase 1).
         
         :param attack_range_id: Attack range ID
         :param abort_check: Optional callable(); if it returns True, build is aborted (raises RuntimeError).
+        :param terraform_running_callback: Optional callable(bool); called with True before and False after Terraform operations.
         :return: Tuple of (router_public_ip, wireguard_config)
         """
         if abort_check and abort_check():
@@ -264,12 +288,18 @@ class AttackRangeController:
             raise RuntimeError("Build aborted")
 
         # Initialize terraform
-        self.terraform_manager.init(backend_was_created)
+        self._run_terraform_step(
+            terraform_running_callback,
+            lambda: self.terraform_manager.init(backend_was_created),
+        )
         if abort_check and abort_check():
             raise RuntimeError("Build aborted")
 
         # Apply terraform
-        self.terraform_manager.apply()
+        self._run_terraform_step(
+            terraform_running_callback,
+            lambda: self.terraform_manager.apply(),
+        )
         if abort_check and abort_check():
             raise RuntimeError("Build aborted")
 
@@ -391,16 +421,38 @@ class AttackRangeController:
         if self.config_path:
             self.config_manager.remove_config()
 
-    def simulate(self, target: str, techniques: list) -> dict:
+    def simulate(
+        self,
+        target: str,
+        techniques: list | None = None,
+        atomics: list | None = None,
+        atomic_files: list | None = None,
+    ) -> dict:
         """
         Run Atomic Red Team techniques against a target server.
         
         :param target: Target server name (must match a server name in attack_range config)
         :param techniques: List of MITRE ATT&CK technique IDs (e.g., ["T1003.001", "T1059.003"])
+        :param atomics: List of dicts with ``technique`` and ``guid`` for individual atomic tests
+        :param atomic_files: List of dicts with custom atomic YAML (``path`` or ``content`` on controller)
         :raises ValueError: If validation fails
         :raises RuntimeError: If simulation execution fails
         """
-        self.logger.info(f"[action] > simulate on target: {target} with techniques: {techniques}\n")
+        techniques = techniques or []
+        atomics = atomics or []
+        atomic_files = atomic_files or []
+        if not techniques and not atomics and not atomic_files:
+            error_msg = (
+                "No techniques, atomics, or atomic files specified. Provide at least one "
+                "technique ID, atomic (technique + guid), or atomic file."
+            )
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        self.logger.info(
+            f"[action] > simulate on target: {target} with techniques: {techniques}, "
+            f"atomics: {len(atomics)}, atomic_files: {len(atomic_files)}\n"
+        )
         
         # Validate that attack range is running
         status = self.config.get("general", {}).get("status", "")
@@ -446,11 +498,18 @@ class AttackRangeController:
         
         # Run the simulation playbook
         self.logger.info(f"Running Atomic Red Team simulation on {target}...")
-        self.logger.info(f"Techniques: {', '.join(techniques)}")
-        
+        if techniques:
+            self.logger.info(f"Techniques: {', '.join(techniques)}")
+        if atomics:
+            self.logger.info(f"Atomics: {len(atomics)} test(s) (technique + guid)")
+        if atomic_files:
+            self.logger.info(f"Atomic files: {len(atomic_files)} custom YAML file(s)")
+
         extra_vars = {
             "target_host": target,  # Use server name as inventory group
-            "techniques": techniques
+            "techniques": techniques,
+            "atomics": atomics,
+            "atomic_files": atomic_files,
         }
         
         # Ensure the p4t12ick.ar_atomic_red_team role is installed
@@ -474,6 +533,115 @@ class AttackRangeController:
         
         # Return execution output for API response
         return execution_output
+
+    def apply_role(self, target: str, roles: list | None = None) -> dict:
+        """
+        Stage and execute local Ansible roles against a target server.
+
+        :param target: Target server name (must match a server name in attack_range config)
+        :param roles: List of dicts with ``path`` (CLI) or ``content_base64`` (API),
+            optional ``name`` override, and optional ``vars``
+        :raises ValueError: If validation fails
+        :raises RuntimeError: If role staging or playbook execution fails
+        """
+        roles = roles or []
+        if not roles:
+            error_msg = "No roles specified. Provide at least one local role."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        self.logger.info(
+            f"[action] > apply_role on target: {target} with {len(roles)} role(s)\n"
+        )
+
+        status = self.config.get("general", {}).get("status", "")
+        if status not in ["running", "completed"]:
+            error_msg = (
+                f"Cannot apply roles. Attack range status is: {status}. "
+                "Must be 'running' or 'completed'."
+            )
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        attack_range_config = self.config.get("attack_range", [])
+        target_server = None
+        for server in attack_range_config:
+            if server.get("name") == target:
+                target_server = server
+                break
+
+        if not target_server:
+            available_servers = [s.get("name") for s in attack_range_config if s.get("name")]
+            error_msg = f"Target server '{target}' not found in attack_range configuration."
+            self.logger.error(error_msg)
+            raise ValueError(
+                f"{error_msg} Available servers: "
+                f"{', '.join(available_servers) if available_servers else 'None'}"
+            )
+
+        self.ansible_manager.update_inventory_attack_range_servers()
+        self.ansible_manager.update_inventory_password()
+
+        import yaml as yaml_lib
+
+        with open(self.ansible_manager.inventory_path, "r", encoding="utf-8") as f:
+            inventory = yaml_lib.safe_load(f)
+
+        if target not in inventory or "hosts" not in inventory.get(target, {}):
+            available_groups = [
+                k for k, v in inventory.items() if isinstance(v, dict) and "hosts" in v
+            ]
+            error_msg = (
+                f"Inventory group '{target}' not found. "
+                f"Available groups: {', '.join(available_groups) if available_groups else 'None'}"
+            )
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        role_specs = []
+        roles_applied = []
+        for role in roles:
+            role_path = role.get("path")
+            content_base64 = role.get("content_base64")
+            name_override = role.get("name")
+            role_vars = role.get("vars") or {}
+
+            if role_path and content_base64:
+                raise ValueError("Each role must specify either path or content_base64, not both.")
+            if not role_path and not content_base64:
+                raise ValueError("Each role must specify either path or content_base64.")
+
+            if role_path:
+                if not os.path.isdir(role_path):
+                    raise ValueError(f"Role path is not a directory: {role_path}")
+                resolved_name = self.ansible_manager.stage_local_role(
+                    os.path.abspath(role_path), name_override
+                )
+            else:
+                resolved_name = self.ansible_manager.stage_local_role_from_tarball(
+                    content_base64, name_override
+                )
+
+            roles_applied.append(resolved_name)
+            role_specs.append({"name": resolved_name, "vars": role_vars})
+
+        become = self.ansible_manager.get_server_become(target)
+        self.ansible_manager.update_apply_roles_playbook(target, role_specs, become)
+
+        self.logger.info(
+            f"Running local roles on {target}: {', '.join(roles_applied)}"
+        )
+        execution_output = self.ansible_manager.run_ansible_playbook_safe(
+            APPLY_LOCAL_ROLES_PLAYBOOK
+        )
+
+        self.logger.info(f"\nRole apply completed successfully on {target}")
+
+        return {
+            "target": target,
+            "roles_applied": roles_applied,
+            "execution_output": execution_output,
+        }
 
     def share(self, name: str) -> str:
         """

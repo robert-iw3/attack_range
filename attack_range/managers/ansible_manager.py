@@ -5,10 +5,14 @@ This module handles Ansible operations including inventory management,
 playbook updates, and playbook execution.
 """
 
+import base64
+import io
 import json
 import os
 import sys
 import re
+import shutil
+import tarfile
 import tempfile
 import yaml
 import time
@@ -17,10 +21,210 @@ import subprocess
 import shlex
 import logging
 import ansible_runner
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 # Galaxy role that must always be updated to latest before VPN playbooks (vpn.yaml, vpn_config.yaml)
 WIREGUARD_GALAXY_ROLE = "p4t12ick.ar_wireguard_vpn"
+WG_CI_CLIENT_CONFIG = "client1.conf"
+WG_CI_ROUTER_IP = "10.0.1.10"
+LOCAL_ROLE_MAX_TAR_BYTES = 50 * 1024 * 1024
+APPLY_LOCAL_ROLES_PLAYBOOK = "apply_local_roles.yaml"
+
+
+def resolve_local_role_name(role_path: str, override: Optional[str] = None) -> str:
+    """Resolve Galaxy-style role name from meta/main.yml or directory basename."""
+    if override and str(override).strip():
+        return str(override).strip()
+
+    meta_candidates = (
+        os.path.join(role_path, "meta", "main.yml"),
+        os.path.join(role_path, "meta", "main.yaml"),
+    )
+    meta_file = next((path for path in meta_candidates if os.path.isfile(path)), None)
+    if meta_file:
+        with open(meta_file, "r", encoding="utf-8") as f:
+            meta = yaml.safe_load(f) or {}
+        galaxy_info = meta.get("galaxy_info") or {}
+        role_name = galaxy_info.get("role_name")
+        namespace = galaxy_info.get("namespace") or galaxy_info.get("author")
+        if role_name and namespace:
+            return f"{namespace}.{role_name}"
+        if role_name:
+            return str(role_name)
+
+    return os.path.basename(os.path.abspath(role_path))
+
+_ART_SUMMARY_TASK_MARKERS = (
+    "Atomic Red Team execution summary",
+    "Simulate playbook execution status",
+)
+_ART_RUN_TASK_MARKERS = (
+    "Run specified Atomic Red Team Technique",
+    "Execute Atomic Red Team test",
+)
+
+
+def _normalize_art_execution_result(entry: dict) -> dict:
+    """Normalize one atomic execution record from Ansible facts or events."""
+    technique = entry.get("technique", "unknown")
+    if isinstance(technique, dict):
+        technique = technique.get("technique", "unknown")
+    guid = str(entry.get("guid") or "").strip()
+    success = bool(entry.get("success"))
+    return {
+        "technique": str(technique),
+        "guid": guid,
+        "success": success,
+        "failed": bool(entry.get("failed", not success)),
+        "return_code": int(entry.get("return_code", entry.get("rc", -1))),
+        "stdout_lines": list(entry.get("stdout_lines") or []),
+        "stderr_lines": list(entry.get("stderr_lines") or []),
+        "stdout": str(entry.get("stdout") or ""),
+        "stderr": str(entry.get("stderr") or ""),
+        "error": str(entry.get("error") or entry.get("msg") or ""),
+    }
+
+
+def _parse_debug_msg_payload(msg: Any) -> dict | None:
+    """Parse structured data from an Ansible debug task ``msg`` field."""
+    if isinstance(msg, dict):
+        if "results" in msg or "summary" in msg:
+            return msg
+        return None
+    if isinstance(msg, str) and msg.strip():
+        try:
+            parsed = json.loads(msg)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _technique_from_task_vars(task_vars: dict) -> tuple[str, str]:
+    item = task_vars.get("item")
+    if isinstance(item, dict):
+        technique = str(item.get("technique") or "unknown")
+        guid = str(item.get("guid") or "").strip()
+        return technique, guid
+    technique = str(task_vars.get("technique") or item or "unknown")
+    guid = str(task_vars.get("atomic_test_guid") or task_vars.get("guid") or "").strip()
+    return technique, guid
+
+
+def _extract_atomic_simulation_output(
+    events_list: list,
+    extra_vars: dict | None = None,
+) -> dict:
+    """
+    Build structured atomic execution output from Ansible runner events.
+
+    Returns a dict with ``results``, ``summary``, and ``by_host`` keys.
+    """
+    by_host: dict[str, dict] = {}
+    extra_vars = extra_vars or {}
+
+    for event in events_list:
+        event_data = event.get("event_data", {})
+        event_type = event.get("event", "")
+        if event_type not in ("runner_on_ok", "runner_on_failed"):
+            continue
+
+        task_name = str(event_data.get("task") or "")
+        host = str(event_data.get("host") or "unknown")
+        res = event_data.get("res", {}) or {}
+
+        if any(marker in task_name for marker in _ART_SUMMARY_TASK_MARKERS):
+            payload = _parse_debug_msg_payload(res.get("msg"))
+            if not payload and "results" in res:
+                payload = res
+            if not payload:
+                continue
+            results = payload.get("results") or []
+            summary = payload.get("summary") or {}
+            status = payload.get("status")
+            if not status and summary:
+                failed = int(summary.get("failed", 0) or 0)
+                status = "failed" if failed else "success"
+            normalized = [_normalize_art_execution_result(r) for r in results if isinstance(r, dict)]
+            by_host[host] = {
+                "results": normalized,
+                "summary": summary,
+                "status": status or "unknown",
+            }
+            continue
+
+        if any(marker in task_name for marker in _ART_RUN_TASK_MARKERS):
+            task_vars = event_data.get("task_vars", {}) or {}
+            technique, guid = _technique_from_task_vars(task_vars)
+            stdout_lines = res.get("stdout_lines") or []
+            stderr_lines = res.get("stderr_lines") or []
+            if not stdout_lines and res.get("stdout"):
+                stdout_lines = str(res.get("stdout")).splitlines()
+            if not stderr_lines and res.get("stderr"):
+                stderr_lines = str(res.get("stderr")).splitlines()
+            failed = bool(res.get("failed"))
+            rc = int(res.get("rc", 1 if failed else 0))
+            entry = _normalize_art_execution_result(
+                {
+                    "technique": technique,
+                    "guid": guid,
+                    "success": not failed and rc == 0,
+                    "failed": failed,
+                    "return_code": rc,
+                    "stdout_lines": stdout_lines,
+                    "stderr_lines": stderr_lines,
+                    "stdout": res.get("stdout", ""),
+                    "stderr": res.get("stderr", ""),
+                    "error": res.get("msg", ""),
+                }
+            )
+            host_bucket = by_host.setdefault(
+                host,
+                {"results": [], "summary": {}, "status": "unknown"},
+            )
+            host_bucket["results"].append(entry)
+
+    # Recompute per-host summaries when built from individual run tasks.
+    for host, payload in by_host.items():
+        results = payload.get("results") or []
+        if results and not payload.get("summary"):
+            succeeded = sum(1 for r in results if r.get("success"))
+            failed = len(results) - succeeded
+            payload["summary"] = {
+                "total": len(results),
+                "succeeded": succeeded,
+                "failed": failed,
+            }
+            payload["status"] = "failed" if failed else "success"
+
+    all_results: list[dict] = []
+    for payload in by_host.values():
+        all_results.extend(payload.get("results") or [])
+
+    total = len(all_results)
+    succeeded = sum(1 for r in all_results if r.get("success"))
+    failed = total - succeeded
+    merged_summary = {
+        "total": total,
+        "succeeded": succeeded,
+        "failed": failed,
+    }
+    overall_status = "unknown"
+    if total:
+        overall_status = "failed" if failed else "success"
+    elif extra_vars.get("techniques") or extra_vars.get("atomics") or extra_vars.get("atomic_files"):
+        overall_status = "unknown"
+
+    if not all_results and not by_host:
+        return {}
+
+    return {
+        "status": overall_status,
+        "summary": merged_summary,
+        "results": all_results,
+        "by_host": by_host,
+    }
 
 
 class AnsibleManager:
@@ -540,6 +744,73 @@ class AnsibleManager:
         self.logger.error(f"Timeout waiting for SSH on {host}:{port} after {timeout}s")
         return False
 
+    @staticmethod
+    def _strip_dns_from_wireguard_config_content(content: str) -> str:
+        """Remove DNS= lines so wg-quick does not break public DNS on CI runners."""
+        lines = [
+            line
+            for line in content.splitlines()
+            if not re.match(r"^\s*DNS\s*=", line, re.IGNORECASE)
+        ]
+        return "\n".join(lines) + ("\n" if lines else "")
+
+    def _prepare_ci_wireguard_config(self) -> str:
+        """
+        Return a WireGuard client config path suitable for CI (no DNS override).
+
+        wg-quick applies DNS= from the client config via resolvconf/systemd-resolved,
+        which breaks outbound DNS on GitHub Actions even with split-tunnel AllowedIPs.
+        Strips DNS from client1.conf in place and restores the original on disconnect.
+        """
+        source_path = self._ci_wireguard_config_path()
+        with open(source_path, "r", encoding="utf-8") as f:
+            original = f.read()
+        stripped = self._strip_dns_from_wireguard_config_content(original)
+        if stripped != original:
+            self._ci_wireguard_config_original = original
+            with open(source_path, "w", encoding="utf-8") as f:
+                f.write(stripped)
+            self.logger.debug("CI mode: removed DNS override from WireGuard client config")
+        return source_path
+
+    def ensure_playbook_roles_installed(self, playbook_name: str, raise_on_failure: bool = False) -> None:
+        """
+        Install Ansible Galaxy roles required by a playbook.
+
+        :param playbook_name: Playbook file name under the ansible directory
+        :param raise_on_failure: If True, raise RuntimeError instead of sys.exit
+        """
+        playbook_path = os.path.join(self.ansible_dir, playbook_name)
+
+        if not os.path.exists(playbook_path):
+            error_msg = f"Playbook not found: {playbook_path}"
+            if raise_on_failure:
+                raise RuntimeError(error_msg)
+            self.logger.error(error_msg)
+            sys.exit(1)
+
+        required_roles = self._get_required_roles_for_playbook(playbook_path)
+        for role_name in required_roles:
+            is_wireguard = role_name == WIREGUARD_GALAXY_ROLE
+            if is_wireguard:
+                if self._is_role_installed(role_name):
+                    continue
+                self.logger.info(f"Installing WireGuard role '{role_name}' from Ansible Galaxy...")
+            elif not self._is_role_installed(role_name):
+                self.logger.info(f"Installing required role '{role_name}' for playbook '{playbook_name}'")
+            else:
+                continue
+            if not self.install_ansible_galaxy_role(role_name, force=not is_wireguard):
+                error_msg = f"Failed to install required role '{role_name}' for playbook '{playbook_name}'"
+                if raise_on_failure:
+                    raise RuntimeError(error_msg)
+                self.logger.error(error_msg)
+                sys.exit(1)
+
+        if WIREGUARD_GALAXY_ROLE in required_roles:
+            self._patch_wireguard_allowed_ips()
+            self._patch_wireguard_server_config()
+
     def run_ansible_playbook(self, playbook_name: str, extra_vars: dict = None) -> None:
         """
         Run an ansible playbook using ansible_runner.
@@ -553,25 +824,7 @@ class AnsibleManager:
             self.logger.error(f"Playbook not found: {playbook_path}")
             sys.exit(1)
 
-        # Ensure required roles for the playbook are installed
-        required_roles = self._get_required_roles_for_playbook(playbook_path)
-        for role_name in required_roles:
-            is_wireguard = role_name == WIREGUARD_GALAXY_ROLE
-            if is_wireguard:
-                if self._is_role_installed(role_name):
-                    continue  # Use existing WireGuard role (no --force) so AllowedIPs fix in ~/.ansible stays
-                self.logger.info(f"Installing WireGuard role '{role_name}' from Ansible Galaxy...")
-            elif not self._is_role_installed(role_name):
-                self.logger.info(f"Installing required role '{role_name}' for playbook '{playbook_name}'")
-            else:
-                continue
-            if not self.install_ansible_galaxy_role(role_name, force=not is_wireguard):
-                self.logger.error(f"Failed to install required role '{role_name}' for playbook '{playbook_name}'")
-                sys.exit(1)
-
-        if WIREGUARD_GALAXY_ROLE in required_roles:
-            self._patch_wireguard_allowed_ips()
-            self._patch_wireguard_server_config()
+        self.ensure_playbook_roles_installed(playbook_name)
 
         self.logger.info(f"Running ansible playbook: {playbook_name}")
 
@@ -675,26 +928,7 @@ class AnsibleManager:
             self.logger.error(error_msg)
             raise RuntimeError(error_msg)
 
-        # Ensure required roles for the playbook are installed
-        required_roles = self._get_required_roles_for_playbook(playbook_path)
-        for role_name in required_roles:
-            is_wireguard = role_name == WIREGUARD_GALAXY_ROLE
-            if is_wireguard:
-                if self._is_role_installed(role_name):
-                    continue  # Use existing WireGuard role (no --force) so AllowedIPs fix in ~/.ansible stays
-                self.logger.info(f"Installing WireGuard role '{role_name}' from Ansible Galaxy...")
-            elif not self._is_role_installed(role_name):
-                self.logger.info(f"Installing required role '{role_name}' for playbook '{playbook_name}'")
-            else:
-                continue
-            if not self.install_ansible_galaxy_role(role_name, force=not is_wireguard):
-                error_msg = f"Failed to install required role '{role_name}' for playbook '{playbook_name}'"
-                self.logger.error(error_msg)
-                raise RuntimeError(error_msg)
-
-        if WIREGUARD_GALAXY_ROLE in required_roles:
-            self._patch_wireguard_allowed_ips()
-            self._patch_wireguard_server_config()
+        self.ensure_playbook_roles_installed(playbook_name, raise_on_failure=True)
 
         self.logger.info(f"Running ansible playbook: {playbook_name}")
 
@@ -734,216 +968,50 @@ class AnsibleManager:
             except OSError:
                 pass
 
-        # Extract execution output from tasks (check both ok and failed events since ignore_errors: True is used)
-        execution_output = {}
-        output_art_found = False
-        events_list = []
-        
-        if hasattr(runner, 'events') and runner.events:
-            # runner.events is a generator, convert to list for processing (only once)
+        execution_output: dict = {}
+        events_list: list = []
+
+        if hasattr(runner, "events") and runner.events:
             try:
                 events_list = list(runner.events)
                 self.logger.debug(f"Processing {len(events_list)} Ansible events")
             except (TypeError, AttributeError):
-                # If it's already a list or not iterable, use it directly
                 events_list = runner.events if isinstance(runner.events, list) else []
-                self.logger.debug(f"Processing events (count unknown - generator or list)")
-            
-            for event in events_list:
-                event_data = event.get('event_data', {})
-                event_type = event.get('event', '')
-                
-                # Look for task results that contain output_art (Atomic Red Team output)
-                # Check both runner_on_ok and runner_on_failed since the task uses ignore_errors: True
-                if event_type in ['runner_on_ok', 'runner_on_failed']:
-                    res = event_data.get('res', {})
-                    
-                    # Debug: log if we see output_art anywhere
-                    if 'output_art' in res:
-                        output_art_found = True
-                        self.logger.info(f"Found output_art in {event_type} event for task: {event_data.get('task', 'unknown')}")
-                    
-                    if 'output_art' in res:
-                        host = event_data.get('host', 'unknown')
-                        output_art = res.get('output_art', {})
-                        stdout_lines = output_art.get('stdout_lines', [])
-                        stderr_lines = output_art.get('stderr_lines', [])
-                        stdout = output_art.get('stdout', '')
-                        
-                        # Try to get output from any of these sources
-                        output_lines = stdout_lines
-                        if not output_lines and stderr_lines:
-                            output_lines = stderr_lines
-                        if not output_lines and stdout:
-                            output_lines = stdout.split('\n') if isinstance(stdout, str) else []
-                        
-                        if output_lines:
-                            if host not in execution_output:
-                                execution_output[host] = []
-                            # Try to get technique from various sources
-                            technique = 'unknown'
-                            
-                            # Method 1: Check event_data for item (from with_items loop)
-                            if 'item' in event_data:
-                                technique = event_data['item']
-                            # Method 2: Check task_vars which contains the item from with_items
-                            elif 'task_vars' in event_data:
-                                task_vars = event_data.get('task_vars', {})
-                                if 'item' in task_vars:
-                                    technique = task_vars['item']
-                                elif 'technique' in task_vars:
-                                    technique = task_vars['technique']
-                            # Method 3: Check if we can get it from the task name or args
-                            elif 'task' in event_data:
-                                task_name = event_data.get('task', '')
-                                # The task might have the technique in its name or args
-                                task_args = event_data.get('task_args', {})
-                                if '_raw_params' in task_args:
-                                    technique = task_args['_raw_params']
-                            
-                            self.logger.info(f"Found execution output for technique {technique} on host {host} ({len(output_lines)} lines)")
-                            execution_output[host].append({
-                                'technique': technique,
-                                'output': output_lines
-                            })
-        
-        # If we didn't find output_art in events, try reading from artifact files
-        if not execution_output and hasattr(runner, 'config'):
+
+        if events_list:
+            execution_output = _extract_atomic_simulation_output(events_list, extra_vars)
+
+        if not execution_output and hasattr(runner, "config"):
             try:
-                artifact_dir = os.path.join(self.ansible_dir, 'artifacts', str(runner.config.ident))
-                if os.path.exists(artifact_dir):
-                    self.logger.info(f"Attempting to read output from artifact directory: {artifact_dir}")
-                    # Method 1: Try reading from job_events directory
-                    job_events_dir = os.path.join(artifact_dir, 'job_events')
-                    if os.path.exists(job_events_dir) and os.path.isdir(job_events_dir):
-                        self.logger.info("Reading from job_events directory")
-                        # Read all event files in the directory
-                        for event_file in sorted(os.listdir(job_events_dir)):
-                            event_path = os.path.join(job_events_dir, event_file)
-                            try:
-                                with open(event_path, 'r') as f:
-                                    event = json.load(f)
-                                    event_data = event.get('event_data', {})
-                                    event_type = event.get('event', '')
-                                    
-                                    if event_type in ['runner_on_ok', 'runner_on_failed']:
-                                        res = event_data.get('res', {})
-                                        if 'output_art' in res:
-                                            host = event_data.get('host', 'unknown')
-                                            output_art = res.get('output_art', {})
-                                            stdout_lines = output_art.get('stdout_lines', [])
-                                            stdout = output_art.get('stdout', '')
-                                            
-                                            output_lines = stdout_lines
-                                            if not output_lines and stdout:
-                                                output_lines = stdout.split('\n') if isinstance(stdout, str) else []
-                                            
-                                            if output_lines:
-                                                if host not in execution_output:
-                                                    execution_output[host] = []
-                                                
-                                                # Get technique from task_vars
-                                                technique = 'unknown'
-                                                task_vars = event_data.get('task_vars', {})
-                                                if 'item' in task_vars:
-                                                    technique = task_vars['item']
-                                                elif 'technique' in task_vars:
-                                                    technique = task_vars['technique']
-                                                
-                                                self.logger.info(f"Found execution output from job_events for technique {technique} on host {host}")
-                                                execution_output[host].append({
-                                                    'technique': technique,
-                                                    'output': output_lines
-                                                })
-                            except (json.JSONDecodeError, IOError) as e:
-                                self.logger.debug(f"Could not parse event file {event_file}: {e}")
-                                continue
-                    
-                    # Method 2: Try parsing stdout file for output_art debug output
-                    if not execution_output:
-                        stdout_path = os.path.join(artifact_dir, 'stdout')
-                        if os.path.exists(stdout_path):
-                            self.logger.info("Attempting to extract output from stdout file")
-                            try:
-                                with open(stdout_path, 'r') as f:
-                                    stdout_content = f.read()
-                                    # Look for the output_art.stdout_lines pattern in the stdout
-                                    # This is a fallback if events don't contain the structured data
-                                    # The stdout might have the debug output showing the output_art
-                                    if 'output_art.stdout_lines' in stdout_content or 'ok: [' in stdout_content:
-                                        # Try to extract the output from the stdout text
-                                        # This is a simple approach - look for the pattern
-                                        import re
-                                        # Look for patterns like: ok: [10.0.2.11] => { "output_art.stdout_lines": [...] }
-                                        pattern = r'ok:\s*\[([^\]]+)\]\s*=>\s*\{[^}]*"output_art\.stdout_lines":\s*\[([^\]]+)\]'
-                                        matches = re.findall(pattern, stdout_content, re.DOTALL)
-                                        if matches:
-                                            self.logger.info(f"Found {len(matches)} output patterns in stdout")
-                                            for host, output_str in matches:
-                                                # Parse the output array
-                                                try:
-                                                    # Clean up the output string and parse as JSON array
-                                                    output_str = output_str.strip()
-                                                    # Remove quotes and split by comma if it's a simple list
-                                                    output_lines = [line.strip().strip('"').strip("'") for line in output_str.split(',')]
-                                                    output_lines = [line for line in output_lines if line]
-                                                    
-                                                    if output_lines:
-                                                        if host not in execution_output:
-                                                            execution_output[host] = []
-                                                        # We don't have technique from stdout, use first technique from extra_vars
-                                                        technique = extra_vars.get('techniques', ['unknown'])[0] if extra_vars and 'techniques' in extra_vars else 'unknown'
-                                                        execution_output[host].append({
-                                                            'technique': technique,
-                                                            'output': output_lines
-                                                        })
-                                                        self.logger.info(f"Extracted output from stdout for host {host}")
-                                                except Exception as e:
-                                                    self.logger.debug(f"Could not parse output from stdout: {e}")
-                            except Exception as e:
-                                self.logger.debug(f"Could not read stdout file: {e}")
+                artifact_dir = os.path.join(self.ansible_dir, "artifacts", str(runner.config.ident))
+                job_events_dir = os.path.join(artifact_dir, "job_events")
+                if os.path.isdir(job_events_dir):
+                    artifact_events = []
+                    for event_file in sorted(os.listdir(job_events_dir)):
+                        event_path = os.path.join(job_events_dir, event_file)
+                        try:
+                            with open(event_path, "r") as f:
+                                artifact_events.append(json.load(f))
+                        except (json.JSONDecodeError, OSError):
+                            continue
+                    execution_output = _extract_atomic_simulation_output(artifact_events, extra_vars)
             except Exception as e:
-                self.logger.debug(f"Could not read from artifact files: {e}")
-        
+                self.logger.debug(f"Could not read simulation output from artifact files: {e}")
+
         if execution_output:
-            self.logger.info(f"Extracted execution output for {len(execution_output)} host(s)")
+            summary = execution_output.get("summary", {})
+            self.logger.info(
+                "Extracted atomic execution output: "
+                f"status={execution_output.get('status')} "
+                f"total={summary.get('total')} "
+                f"succeeded={summary.get('succeeded')} "
+                f"failed={summary.get('failed')}"
+            )
         else:
-            if output_art_found:
-                self.logger.warning("Found output_art in events but couldn't extract output lines")
-            else:
-                self.logger.warning("No execution output found in Ansible events - output_art not found in any event")
-                # Debug: log some sample events to understand structure
-                if events_list:
-                    # Find all events with output_art or related to the atomic red team task
-                    art_related_events = []
-                    for e in events_list:
-                        event_data = e.get('event_data', {})
-                        task_name = event_data.get('task', '')
-                        res = event_data.get('res', {})
-                        if 'output_art' in res or 'Run specified Atomic Red Team Technique' in task_name or 'Run Atomic Red Team' in task_name:
-                            art_related_events.append({
-                                'event': e.get('event'),
-                                'task': task_name,
-                                'res_keys': list(res.keys()) if res else [],
-                                'has_output_art': 'output_art' in res
-                            })
-                    
-                    if art_related_events:
-                        self.logger.info(f"Found {len(art_related_events)} events related to Atomic Red Team:")
-                        for art_event in art_related_events[:5]:  # Show first 5
-                            self.logger.info(f"  - Event: {art_event['event']}, Task: {art_event['task']}, Res keys: {art_event['res_keys']}, Has output_art: {art_event['has_output_art']}")
-                    else:
-                        # Show sample of all ok/failed events
-                        sample_events = [e for e in events_list if e.get('event') in ['runner_on_ok', 'runner_on_failed']][:5]
-                        for sample in sample_events:
-                            event_data = sample.get('event_data', {})
-                            task_name = event_data.get('task', 'unknown')
-                            res_keys = list(event_data.get('res', {}).keys())
-                            self.logger.debug(f"Sample event - Task: {task_name}, Res keys: {res_keys}")
+            self.logger.warning("No structured atomic execution output found in Ansible events")
 
         if runner.status == "successful":
             self.logger.info(f"Playbook {playbook_name} completed successfully")
-            # Return execution output if available
             return execution_output if execution_output else None
         else:
             self.logger.error(f"Playbook {playbook_name} failed with status: {runner.status}")
@@ -1058,42 +1126,67 @@ class AnsibleManager:
         
         return list(set(required_roles))  # Return unique roles
 
+    def _roles_install_path(self) -> str:
+        """Directory where ansible-galaxy installs roles for this attack range."""
+        return os.path.join(self.ansible_dir, "roles")
+
+    def _get_local_role_overrides(self) -> dict[str, str]:
+        """
+        Parse ATTACK_RANGE_LOCAL_ROLES env var (JSON map of galaxy role name -> local path).
+
+        :return: Dict of role name to expanded local filesystem path
+        """
+        raw = os.environ.get("ATTACK_RANGE_LOCAL_ROLES", "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            self.logger.warning(
+                "ATTACK_RANGE_LOCAL_ROLES is not valid JSON; ignoring local role overrides"
+            )
+            return {}
+        if not isinstance(parsed, dict):
+            self.logger.warning(
+                "ATTACK_RANGE_LOCAL_ROLES must be a JSON object; ignoring local role overrides"
+            )
+            return {}
+        overrides: dict[str, str] = {}
+        for key, value in parsed.items():
+            if isinstance(key, str) and isinstance(value, str) and key and value:
+                overrides[key] = os.path.expanduser(value)
+        return overrides
+
+    def _resolve_role_dir(self, role_name: str) -> Optional[str]:
+        """
+        Return the installed role directory for a Galaxy role name, if present.
+
+        Checks terraform/ansible/roles and ~/.ansible/roles using dot and underscore
+        directory name variants.
+        """
+        role_dir_underscore = role_name.replace(".", "_")
+        role_dir_dot = role_name
+        search_bases = [
+            self._roles_install_path(),
+            os.path.expanduser("~/.ansible/roles"),
+        ]
+        for base in search_bases:
+            if not os.path.isdir(base):
+                continue
+            for variant in (role_dir_dot, role_dir_underscore):
+                candidate = os.path.join(base, variant)
+                if os.path.isdir(candidate):
+                    return candidate
+        return None
+
     def _is_role_installed(self, role_name: str) -> bool:
         """
         Check if an Ansible Galaxy role is installed.
-        
+
         :param role_name: Name of the role (e.g., 'p4t12ick.ar_wireguard_vpn')
         :return: True if role is installed, False otherwise
         """
-        # Ansible Galaxy installs roles in roles/ directory with format: namespace.rolename
-        # The directory name is the role name with dots replaced or kept depending on version
-        roles_dir = os.path.join(self.ansible_dir, "roles")
-        
-        # Check if roles directory exists
-        if not os.path.exists(roles_dir):
-            return False
-        
-        # Try different possible directory names
-        # Format 1: namespace_rolename (dots replaced with underscores)
-        role_dir_underscore = role_name.replace('.', '_')
-        # Format 2: namespace.rolename (dots kept)
-        role_dir_dot = role_name
-        
-        # Check both formats
-        if os.path.exists(os.path.join(roles_dir, role_dir_underscore)):
-            return True
-        if os.path.exists(os.path.join(roles_dir, role_dir_dot)):
-            return True
-        
-        # Also check in ~/.ansible/roles (default location)
-        home_roles_dir = os.path.expanduser("~/.ansible/roles")
-        if os.path.exists(home_roles_dir):
-            if os.path.exists(os.path.join(home_roles_dir, role_dir_underscore)):
-                return True
-            if os.path.exists(os.path.join(home_roles_dir, role_dir_dot)):
-                return True
-        
-        return False
+        return self._resolve_role_dir(role_name) is not None
 
     def _patch_wireguard_allowed_ips(self) -> None:
         """
@@ -1101,7 +1194,10 @@ class AnsibleManager:
         can reach 10.0.2.* (e.g. Splunk). Fixes 10.0.1.1/24, 10.0.2.1/24 -> 10.0.1.0/24, 10.0.2.0/24.
         Idempotent: no-op if already correct.
         """
-        path = os.path.expanduser("~/.ansible/roles/p4t12ick.ar_wireguard_vpn/templates/client.j2")
+        role_dir = self._resolve_role_dir(WIREGUARD_GALAXY_ROLE)
+        if not role_dir:
+            return
+        path = os.path.join(role_dir, "templates", "client.j2")
         if not os.path.exists(path):
             return
         try:
@@ -1122,7 +1218,10 @@ class AnsibleManager:
         client1 and shared clients can reach 10.0.2.*. PreDown for FORWARD uses
         || true so down does not abort if the rule is missing. Idempotent.
         """
-        path = os.path.expanduser("~/.ansible/roles/p4t12ick.ar_wireguard_vpn/templates/wg0.j2")
+        role_dir = self._resolve_role_dir(WIREGUARD_GALAXY_ROLE)
+        if not role_dir:
+            return
+        path = os.path.join(role_dir, "templates", "wg0.j2")
         if not os.path.exists(path):
             return
         # Target: SaveConfig=false, NAT, FORWARD. FORWARD PreDown uses || true to avoid abort when rule missing.
@@ -1185,29 +1284,49 @@ class AnsibleManager:
         """
         Install a specific Ansible Galaxy role with retry logic for transient SSL/network errors.
 
+        When ATTACK_RANGE_LOCAL_ROLES maps role_name to a local path, installs from that
+        path instead of Ansible Galaxy.
+
         :param role_name: Name of the role to install (e.g., 'p4t12ick.ar_wireguard_vpn')
         :param force: If True, pass --force to overwrite existing; if False, skip when already installed.
         :param max_retries: Maximum number of retry attempts for transient errors (default: 3)
         :return: True if installation succeeded, False otherwise
         """
+        local_overrides = self._get_local_role_overrides()
+        local_path = local_overrides.get(role_name)
+        if local_path is not None:
+            if not os.path.isdir(local_path):
+                self.logger.error(
+                    f"Local role path for '{role_name}' does not exist or is not a directory: {local_path}"
+                )
+                return False
+            install_target = f"{local_path},{role_name}"
+            self.logger.info(
+                f"Installing role '{role_name}' from local path '{local_path}' (ATTACK_RANGE_LOCAL_ROLES)"
+            )
+            max_retries = 1
+        else:
+            install_target = role_name
+
         cwd = os.getcwd()
+        roles_path = self._roles_install_path()
         try:
             os.chdir(self.ansible_dir)
-            
-            cmd = ["ansible-galaxy", "install", role_name]
+
+            cmd = ["ansible-galaxy", "install", install_target, "-p", roles_path]
             if force:
                 cmd.append("--force")
-            
-            # Retry logic for transient SSL/network errors
+
+            # Retry logic for transient SSL/network errors (Galaxy downloads only)
             for attempt in range(max_retries):
                 if attempt > 0:
                     # Exponential backoff: 2^attempt seconds (2, 4, 8 seconds)
                     wait_time = 2 ** attempt
                     self.logger.warning(f"Retrying installation of role '{role_name}' (attempt {attempt + 1}/{max_retries}) after {wait_time} seconds...")
                     time.sleep(wait_time)
-                else:
+                elif local_path is None:
                     self.logger.info(f"Installing role: {role_name}")
-                
+
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -1220,14 +1339,14 @@ class AnsibleManager:
                     if result.stdout:
                         self.logger.debug(result.stdout)
                     return True
-                
+
                 # Check if this is a transient SSL/network error that might benefit from retry
                 error_output = result.stderr.lower() if result.stderr else ""
                 is_transient_error = any(keyword in error_output for keyword in [
-                    "ssl", "unexpected_eof", "eof occurred", "connection", 
+                    "ssl", "unexpected_eof", "eof occurred", "connection",
                     "timeout", "temporary failure", "network", "urlopen error"
                 ])
-                
+
                 if is_transient_error and attempt < max_retries - 1:
                     # Log warning but continue to retry
                     self.logger.warning(f"Transient error installing role '{role_name}' (attempt {attempt + 1}/{max_retries}): {result.stderr[:200]}")
@@ -1238,7 +1357,7 @@ class AnsibleManager:
                     if result.stdout:
                         self.logger.error(f"stdout: {result.stdout}")
                     return False
-            
+
             # Should not reach here, but just in case
             return False
         finally:
@@ -1290,11 +1409,234 @@ class AnsibleManager:
 
         self.logger.info(f"All {len(roles_to_install)} ansible galaxy roles installed successfully")
 
+    def _validate_role_directory(self, path: str) -> None:
+        """Require a directory with tasks/main.yml or tasks/main.yaml."""
+        if not os.path.isdir(path):
+            raise ValueError(f"Role path is not a directory: {path}")
+        tasks_candidates = (
+            os.path.join(path, "tasks", "main.yml"),
+            os.path.join(path, "tasks", "main.yaml"),
+        )
+        if not any(os.path.isfile(candidate) for candidate in tasks_candidates):
+            raise ValueError(f"Invalid Ansible role: missing tasks/main.yml at {path}")
+
+    def _resolve_role_name(self, role_path: str, override: Optional[str] = None) -> str:
+        """Resolve Galaxy-style role name from meta/main.yml or directory basename."""
+        return resolve_local_role_name(role_path, override)
+
+    def _local_roles_dir(self) -> str:
+        roles_dir = os.path.join(self.ansible_dir, "roles")
+        os.makedirs(roles_dir, exist_ok=True)
+        return roles_dir
+
+    def _stage_role_copy(self, role_path: str, role_name: str) -> str:
+        """Copy a validated role tree into terraform/ansible/roles/."""
+        self._validate_role_directory(role_path)
+        roles_dir = self._local_roles_dir()
+        dest = os.path.join(roles_dir, role_name)
+        if os.path.exists(dest):
+            self.logger.warning(f"Overwriting existing staged role at {dest}")
+            shutil.rmtree(dest)
+        shutil.copytree(role_path, dest)
+        self.logger.info(f"Staged local role '{role_name}' at {dest}")
+        return role_name
+
+    def _is_safe_tar_member(self, member: tarfile.TarInfo, dest_dir: str) -> bool:
+        if member.name.startswith("/") or member.name.startswith("\\"):
+            return False
+        target = os.path.realpath(os.path.join(dest_dir, member.name))
+        dest_real = os.path.realpath(dest_dir)
+        return target == dest_real or target.startswith(dest_real + os.sep)
+
+    def _find_extracted_role_root(self, extract_dir: str) -> str:
+        try:
+            self._validate_role_directory(extract_dir)
+            return extract_dir
+        except ValueError:
+            pass
+
+        entries = [name for name in os.listdir(extract_dir) if not name.startswith(".")]
+        if len(entries) == 1:
+            candidate = os.path.join(extract_dir, entries[0])
+            if os.path.isdir(candidate):
+                self._validate_role_directory(candidate)
+                return candidate
+
+        for name in entries:
+            candidate = os.path.join(extract_dir, name)
+            if os.path.isdir(candidate):
+                try:
+                    self._validate_role_directory(candidate)
+                    return candidate
+                except ValueError:
+                    continue
+
+        raise ValueError("Could not find a valid Ansible role in tarball (expected tasks/main.yml)")
+
+    def _extract_role_tarball(self, tarball_bytes: bytes, dest_dir: str) -> str:
+        os.makedirs(dest_dir, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(tarball_bytes), mode="r:*") as tar:
+            for member in tar.getmembers():
+                if not self._is_safe_tar_member(member, dest_dir):
+                    raise ValueError(f"Unsafe path in role tarball: {member.name}")
+            extract_kwargs = {}
+            if "filter" in tar.extractall.__code__.co_varnames:
+                extract_kwargs["filter"] = "data"
+            tar.extractall(dest_dir, **extract_kwargs)
+        return self._find_extracted_role_root(dest_dir)
+
+    def stage_local_role(self, role_path: str, name: Optional[str] = None) -> str:
+        """Validate and stage a local role directory on the Ansible controller."""
+        role_path = os.path.abspath(role_path)
+        role_name = self._resolve_role_name(role_path, name)
+        return self._stage_role_copy(role_path, role_name)
+
+    def stage_local_role_from_tarball(self, content_base64: str, name: Optional[str] = None) -> str:
+        """Decode a base64 gzip tarball, extract safely, and stage the role."""
+        try:
+            tarball_bytes = base64.b64decode(content_base64, validate=True)
+        except Exception as exc:
+            raise ValueError(f"Invalid base64 role tarball: {exc}") from exc
+
+        if len(tarball_bytes) > LOCAL_ROLE_MAX_TAR_BYTES:
+            raise ValueError(
+                f"Role tarball exceeds maximum size of {LOCAL_ROLE_MAX_TAR_BYTES} bytes"
+            )
+
+        with tempfile.TemporaryDirectory() as extract_dir:
+            role_root = self._extract_role_tarball(tarball_bytes, extract_dir)
+            role_name = self._resolve_role_name(role_root, name)
+            return self._stage_role_copy(role_root, role_name)
+
+    def get_server_become(self, target: str) -> Optional[bool]:
+        """
+        Return playbook-level become for a target host group.
+
+        None means omit become (default for Windows). True/false set become explicitly.
+        """
+        attack_range_config = self.config.get("attack_range", [])
+        for entry in attack_range_config:
+            entry_name = entry.get("name")
+            roles = entry.get("roles", [])
+            is_match = entry_name == target
+            if not is_match:
+                for role in roles:
+                    if isinstance(role, dict) and role.get("inventory_name") == target:
+                        is_match = True
+                        break
+            if not is_match:
+                continue
+
+            is_windows = entry.get("windows", False)
+            entry_become = entry.get("become")
+            if is_windows:
+                return entry_become
+            if entry_become is not None:
+                return entry_become
+            return True
+
+        return True
+
+    def update_apply_roles_playbook(
+        self,
+        target_host: str,
+        role_specs: List[Dict[str, Any]],
+        become: Optional[bool],
+    ) -> None:
+        """Write apply_local_roles.yaml for staged local roles on a single target."""
+        playbook_path = os.path.join(self.ansible_dir, APPLY_LOCAL_ROLES_PLAYBOOK)
+        play: Dict[str, Any] = {
+            "hosts": target_host,
+            "roles": [],
+        }
+        if become is True:
+            play["become"] = True
+        elif become is False:
+            play["become"] = False
+
+        for spec in role_specs:
+            role_entry: Dict[str, Any] = {"role": spec["name"]}
+            role_vars = spec.get("vars") or {}
+            if role_vars:
+                role_entry["vars"] = role_vars
+            play["roles"].append(role_entry)
+
+        with open(playbook_path, "w", encoding="utf-8") as f:
+            yaml.dump([play], f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+        self.logger.info(
+            f"{APPLY_LOCAL_ROLES_PLAYBOOK} generated for target '{target_host}' "
+            f"with {len(role_specs)} role(s)"
+        )
+
+    def _ci_wireguard_config_path(self) -> str:
+        return os.path.join(self.ansible_dir, "client_configs", WG_CI_CLIENT_CONFIG)
+
+    def connect_wireguard_ci(self) -> None:
+        """
+        Connect to the attack range VPN non-interactively (CI / GitHub Actions).
+
+        Requires wireguard-tools (wg-quick) and passwordless sudo (as on GitHub Actions).
+        Uses the generated client config in-place; wg-quick accepts any config path.
+        """
+        source_config_path = self._ci_wireguard_config_path()
+        if not os.path.exists(source_config_path):
+            self.logger.error(f"WireGuard config file not found: {source_config_path}")
+            sys.exit(1)
+
+        wireguard_config_path = self._prepare_ci_wireguard_config()
+        self._ci_wireguard_config_active = wireguard_config_path
+        self.logger.info(f"CI mode: bringing up WireGuard from {source_config_path}")
+        result = subprocess.run(
+            ["sudo", "wg-quick", "up", wireguard_config_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr or result.stdout or "unknown error"
+            self.logger.error(f"wg-quick up failed: {detail}")
+            self.logger.error(
+                "CI WireGuard requires passwordless sudo (GitHub Actions) or run without "
+                "ATTACK_RANGE_CI=1 and connect manually when prompted."
+            )
+            sys.exit(1)
+
+        if not self.wait_for_ssh(WG_CI_ROUTER_IP, timeout=120):
+            self.logger.error(f"VPN connected but router {WG_CI_ROUTER_IP} is not reachable")
+            sys.exit(1)
+
+        self.logger.info("CI mode: VPN connection established")
+
+    def disconnect_wireguard_ci(self) -> None:
+        """Tear down the CI WireGuard interface if it is up."""
+        wireguard_config_path = getattr(self, "_ci_wireguard_config_active", None)
+        if not wireguard_config_path:
+            wireguard_config_path = self._ci_wireguard_config_path()
+        if not os.path.exists(wireguard_config_path):
+            return
+        subprocess.run(
+            ["sudo", "wg-quick", "down", wireguard_config_path],
+            capture_output=True,
+            text=True,
+        )
+        original = getattr(self, "_ci_wireguard_config_original", None)
+        if original is not None:
+            with open(self._ci_wireguard_config_path(), "w", encoding="utf-8") as f:
+                f.write(original)
+            self._ci_wireguard_config_original = None
+        self._ci_wireguard_config_active = None
+
     def prompt_vpn_connection(self) -> None:
         """
         Display the WireGuard configuration and prompt user to connect to VPN.
         Waits for user confirmation before continuing.
+
+        When ATTACK_RANGE_CI=1, connects WireGuard automatically instead of prompting.
         """
+        if os.environ.get("ATTACK_RANGE_CI") == "1":
+            self.connect_wireguard_ci()
+            return
+
         # Path to the wireguard config file
         wireguard_config_path = os.path.join(self.ansible_dir, "client_configs", "client1.conf")
 
